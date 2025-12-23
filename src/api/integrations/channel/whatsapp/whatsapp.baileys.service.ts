@@ -522,17 +522,32 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private async getMessage(key: proto.IMessageKey, full = false) {
     try {
-      // Use raw SQL to avoid JSON path issues
-      const webMessageInfo = (await this.prismaRepository.$queryRaw`
-        SELECT * FROM "Message"
-        WHERE "instanceId" = ${this.instanceId}
-        AND "key"->>'id' = ${key.id}
-      `) as proto.IWebMessageInfo[];
+      const dbProvider = this.configService.get<Database>('DATABASE').PROVIDER;
+
+      let webMessageInfo: proto.IWebMessageInfo[];
+
+      if (dbProvider === 'mysql') {
+        // MySQL syntax with JSON_UNQUOTE and JSON_EXTRACT
+        webMessageInfo = await this.prismaRepository.$queryRawUnsafe<proto.IWebMessageInfo[]>(
+          `SELECT * FROM Message
+           WHERE instanceId = ?
+           AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ?`,
+          this.instanceId,
+          key.id,
+        );
+      } else {
+        // PostgreSQL syntax
+        webMessageInfo = await this.prismaRepository.$queryRaw<proto.IWebMessageInfo[]>`
+          SELECT * FROM "Message"
+          WHERE "instanceId" = ${this.instanceId}
+          AND "key"->>'id' = ${key.id}
+        `;
+      }
 
       if (full) {
         return webMessageInfo[0];
       }
-      if (webMessageInfo[0].message?.pollCreationMessage) {
+      if (webMessageInfo[0]?.message?.pollCreationMessage) {
         const messageSecretBase64 = webMessageInfo[0].message?.messageContextInfo?.messageSecret;
 
         if (typeof messageSecretBase64 === 'string') {
@@ -1625,8 +1640,8 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           let findMessage: any;
-          const configDatabaseData = this.configService.get<Database>('DATABASE').SAVE_DATA;
-          if (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE) {
+          const configDatabaseData = this.configService.get<Database>('DATABASE');
+          if (configDatabaseData.SAVE_DATA.HISTORIC || configDatabaseData.SAVE_DATA.NEW_MESSAGE) {
             // Use raw SQL to avoid JSON path issues
             const protocolMapKey = `protocol_${key.id}`;
             const originalMessageId = (await this.baileysCache.get(protocolMapKey)) as string;
@@ -1637,12 +1652,27 @@ export class BaileysStartupService extends ChannelStartupService {
 
             const searchId = originalMessageId || key.id;
 
-            const messages = (await this.prismaRepository.$queryRaw`
-              SELECT * FROM "Message"
-              WHERE "instanceId" = ${this.instanceId}
-              AND "key"->>'id' = ${searchId}
-              LIMIT 1
-            `) as any[];
+            let messages: any[];
+
+            if (configDatabaseData.PROVIDER === 'mysql') {
+              // MySQL syntax with JSON_UNQUOTE and JSON_EXTRACT
+              messages = await this.prismaRepository.$queryRawUnsafe<any[]>(
+                `SELECT * FROM Message
+                 WHERE instanceId = ?
+                 AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ?
+                 LIMIT 1`,
+                this.instanceId,
+                searchId,
+              );
+            } else {
+              // PostgreSQL syntax
+              messages = await this.prismaRepository.$queryRaw<any[]>`
+                SELECT * FROM "Message"
+                WHERE "instanceId" = ${this.instanceId}
+                AND "key"->>'id' = ${searchId}
+                LIMIT 1
+              `;
+            }
             findMessage = messages[0] || null;
 
             if (!findMessage?.id) {
@@ -4734,46 +4764,100 @@ export class BaileysStartupService extends ChannelStartupService {
   private async updateMessagesReadedByTimestamp(remoteJid: string, timestamp?: number): Promise<number> {
     if (timestamp === undefined || timestamp === null) return 0;
 
-    // Use raw SQL to avoid JSON path issues
-    const result = await this.prismaRepository.$executeRaw`
-      UPDATE "Message"
-      SET "status" = ${status[4]}
-      WHERE "instanceId" = ${this.instanceId}
-      AND "key"->>'remoteJid' = ${remoteJid}
-      AND ("key"->>'fromMe')::boolean = false
-      AND "messageTimestamp" <= ${timestamp}
-      AND ("status" IS NULL OR "status" = ${status[3]})
-    `;
+    try {
+      const dbProvider = this.configService.get<Database>('DATABASE').PROVIDER;
 
-    if (result) {
-      if (result > 0) {
-        this.updateChatUnreadMessages(remoteJid);
+      let result: number;
+
+      if (dbProvider === 'mysql') {
+        // MySQL syntax with JSON_UNQUOTE and JSON_EXTRACT
+        result = await this.prismaRepository.$executeRawUnsafe(
+          `UPDATE Message
+           SET status = ?
+           WHERE instanceId = ?
+           AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJid')) = ?
+           AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.fromMe')) = 'false'
+           AND messageTimestamp <= ?
+           AND (status IS NULL OR status = ?)`,
+          status[4],
+          this.instanceId,
+          remoteJid,
+          timestamp,
+          status[3],
+        );
+      } else {
+        // PostgreSQL syntax
+        result = await this.prismaRepository.$executeRaw`
+          UPDATE "Message"
+          SET "status" = ${status[4]}
+          WHERE "instanceId" = ${this.instanceId}
+          AND "key"->>'remoteJid' = ${remoteJid}
+          AND ("key"->>'fromMe')::boolean = false
+          AND "messageTimestamp" <= ${timestamp}
+          AND ("status" IS NULL OR "status" = ${status[3]})
+        `;
       }
 
-      return result;
-    }
+      if (result) {
+        if (result > 0) {
+          this.updateChatUnreadMessages(remoteJid);
+        }
 
-    return 0;
+        return result;
+      }
+
+      return 0;
+    } catch (error) {
+      this.logger.error(`Error updating messages read status: ${error?.message}`);
+      return 0;
+    }
   }
 
   private async updateChatUnreadMessages(remoteJid: string): Promise<number> {
-    const [chat, unreadMessages] = await Promise.all([
-      this.prismaRepository.chat.findFirst({ where: { remoteJid } }),
-      // Use raw SQL to avoid JSON path issues
-      this.prismaRepository.$queryRaw`
-        SELECT COUNT(*)::int as count FROM "Message"
-        WHERE "instanceId" = ${this.instanceId}
-        AND "key"->>'remoteJid' = ${remoteJid}
-        AND ("key"->>'fromMe')::boolean = false
-        AND "status" = ${status[3]}
-      `.then((result: any[]) => result[0]?.count || 0),
-    ]);
+    try {
+      const dbProvider = this.configService.get<Database>('DATABASE').PROVIDER;
 
-    if (chat && chat.unreadMessages !== unreadMessages) {
-      await this.prismaRepository.chat.update({ where: { id: chat.id }, data: { unreadMessages } });
+      let unreadMessagesPromise: Promise<number>;
+
+      if (dbProvider === 'mysql') {
+        // MySQL syntax
+        unreadMessagesPromise = this.prismaRepository
+          .$queryRawUnsafe<{ count: number }[]>(
+            `SELECT COUNT(*) as count FROM Message
+             WHERE instanceId = ?
+             AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJid')) = ?
+             AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.fromMe')) = 'false'
+             AND status = ?`,
+            this.instanceId,
+            remoteJid,
+            status[3],
+          )
+          .then((result) => Number(result[0]?.count) || 0);
+      } else {
+        // PostgreSQL syntax
+        unreadMessagesPromise = this.prismaRepository.$queryRaw<{ count: number }[]>`
+          SELECT COUNT(*)::int as count FROM "Message"
+          WHERE "instanceId" = ${this.instanceId}
+          AND "key"->>'remoteJid' = ${remoteJid}
+          AND ("key"->>'fromMe')::boolean = false
+          AND "status" = ${status[3]}
+        `.then((result) => result[0]?.count || 0);
+      }
+
+      const [chat, unreadMessages] = await Promise.all([
+        this.prismaRepository.chat.findFirst({ where: { remoteJid } }),
+        unreadMessagesPromise,
+      ]);
+
+      if (chat && chat.unreadMessages !== unreadMessages) {
+        await this.prismaRepository.chat.update({ where: { id: chat.id }, data: { unreadMessages } });
+      }
+
+      return unreadMessages;
+    } catch (error) {
+      this.logger.error(`Error updating chat unread messages: ${error?.message}`);
+      return 0;
     }
-
-    return unreadMessages;
   }
 
   private async addLabel(labelId: string, instanceId: string, chatId: string) {
