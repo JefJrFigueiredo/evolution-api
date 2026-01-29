@@ -1493,7 +1493,14 @@ export class BaileysStartupService extends ChannelStartupService {
           if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
             messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
           }
-          console.log(messageRaw);
+
+          // Resolve LID to phone number for group message participants
+          if (messageRaw.key.participant?.includes('@lid')) {
+            const key = received.key as any;
+            if (key.participantAlt) {
+              messageRaw.key.participant = key.participantAlt;
+            }
+          }
 
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
