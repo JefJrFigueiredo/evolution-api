@@ -9,7 +9,7 @@ import { TypebotService } from '@api/integrations/chatbot/typebot/services/typeb
 import { PrismaRepository, Query } from '@api/repository/repository.service';
 import { eventManager, waMonitor } from '@api/server.module';
 import { Events, wa } from '@api/types/wa.types';
-import { Auth, Chatwoot, ConfigService, HttpServer, Proxy } from '@config/env.config';
+import { Auth, Chatwoot, ConfigService, Database, HttpServer, Proxy } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { NotFoundException } from '@exceptions';
 import { Contact, Message, Prisma } from '@prisma/client';
@@ -605,6 +605,113 @@ export class ChannelStartupService {
       participants?: string;
     };
 
+    if (!query?.offset) {
+      query.offset = 50;
+    }
+
+    if (!query?.page) {
+      query.page = 1;
+    }
+
+    const dbProvider = this.configService.get<Database>('DATABASE').PROVIDER;
+    const hasKeyFilters = keyFilters?.id || keyFilters?.fromMe || keyFilters?.remoteJid || keyFilters?.participants;
+
+    if (dbProvider === 'mysql' && hasKeyFilters) {
+      // MySQL: use raw SQL for JSON path filtering, then Prisma for relations
+      const conditions: string[] = ['instanceId = ?'];
+      const params: any[] = [this.instanceId];
+
+      if (query?.where?.id) {
+        conditions.push('id = ?');
+        params.push(query.where.id);
+      }
+      if (query?.where?.source) {
+        conditions.push('source = ?');
+        params.push(query.where.source);
+      }
+      if (query?.where?.messageType) {
+        conditions.push('messageType = ?');
+        params.push(query.where.messageType);
+      }
+      if (query?.where?.messageTimestamp?.['gte'] && query?.where?.messageTimestamp?.['lte']) {
+        conditions.push('messageTimestamp >= ? AND messageTimestamp <= ?');
+        params.push(
+          Math.floor(new Date(query.where.messageTimestamp['gte']).getTime() / 1000),
+          Math.floor(new Date(query.where.messageTimestamp['lte']).getTime() / 1000),
+        );
+      }
+
+      if (keyFilters?.id) {
+        conditions.push("JSON_UNQUOTE(JSON_EXTRACT(`key`, '$.id')) = ?");
+        params.push(keyFilters.id);
+      }
+      if (keyFilters?.fromMe) {
+        conditions.push("JSON_UNQUOTE(JSON_EXTRACT(`key`, '$.fromMe')) = 'true'");
+      }
+      if (keyFilters?.remoteJid) {
+        conditions.push("JSON_UNQUOTE(JSON_EXTRACT(`key`, '$.remoteJid')) = ?");
+        params.push(keyFilters.remoteJid);
+      }
+      if (keyFilters?.participants) {
+        conditions.push("JSON_UNQUOTE(JSON_EXTRACT(`key`, '$.participant')) = ?");
+        params.push(keyFilters.participants);
+      }
+
+      const whereClause = conditions.join(' AND ');
+
+      // Count query
+      const countResult = await this.prismaRepository.$queryRawUnsafe<{ count: number }[]>(
+        `SELECT COUNT(*) as count FROM Message WHERE ${whereClause}`,
+        ...params,
+      );
+      const count = Number(countResult[0]?.count) || 0;
+
+      // Get matching message IDs with pagination
+      const skip = query.offset * (query.page === 1 ? 0 : query.page - 1);
+      const messageIdRows = await this.prismaRepository.$queryRawUnsafe<{ id: string }[]>(
+        `SELECT id FROM Message WHERE ${whereClause} ORDER BY messageTimestamp DESC LIMIT ? OFFSET ?`,
+        ...params,
+        query.offset,
+        skip,
+      );
+      const messageIds = messageIdRows.map((row) => row.id);
+
+      let messages = [];
+      if (messageIds.length > 0) {
+        messages = await this.prismaRepository.message.findMany({
+          where: { id: { in: messageIds } },
+          orderBy: { messageTimestamp: 'desc' },
+          select: {
+            id: true,
+            key: true,
+            pushName: true,
+            messageType: true,
+            message: true,
+            messageTimestamp: true,
+            instanceId: true,
+            source: true,
+            status: true,
+            contextInfo: true,
+            MessageUpdate: {
+              select: {
+                status: true,
+              },
+            },
+          },
+        });
+      }
+
+      return {
+        messages: {
+          total: count,
+          pages: Math.ceil(count / query.offset),
+          currentPage: query.page,
+          records: messages,
+        },
+      };
+    }
+
+    // PostgreSQL (or no key filters): use Prisma JSON path filtering
     const timestampFilter = {};
     if (query?.where?.messageTimestamp) {
       if (query.where.messageTimestamp['gte'] && query.where.messageTimestamp['lte']) {
@@ -630,14 +737,6 @@ export class ChannelStartupService {
         ],
       },
     });
-
-    if (!query?.offset) {
-      query.offset = 50;
-    }
-
-    if (!query?.page) {
-      query.page = 1;
-    }
 
     const messages = await this.prismaRepository.message.findMany({
       where: {

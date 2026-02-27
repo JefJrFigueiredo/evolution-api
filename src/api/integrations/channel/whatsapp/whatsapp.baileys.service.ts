@@ -1963,19 +1963,72 @@ export class BaileysStartupService extends ChannelStartupService {
 
             if (events['message-receipt.update']) {
               const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
-              const remotesJidMap: Record<string, number> = {};
+              const remotesJidMap: Record<string, { timestamp: number; hasExternalReceipt: boolean }> = {};
+              const selfJid = this.instance.wuid;
 
               for (const event of payload) {
                 if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
-                  remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+                  const isExternalReceipt =
+                    event.key.participant !== undefined &&
+                    event.key.participant !== selfJid &&
+                    event.key.participant?.replace(/:\d+/, '') !== selfJid;
+                  const existing = remotesJidMap[event.key.remoteJid];
+
+                  if (!existing || event.receipt.readTimestamp > existing.timestamp) {
+                    remotesJidMap[event.key.remoteJid] = {
+                      timestamp: event.receipt.readTimestamp,
+                      hasExternalReceipt: isExternalReceipt || (existing?.hasExternalReceipt ?? false),
+                    };
+                  } else if (isExternalReceipt && !existing.hasExternalReceipt) {
+                    existing.hasExternalReceipt = true;
+                  }
                 }
               }
 
               await Promise.all(
                 Object.keys(remotesJidMap).map(async (remoteJid) =>
-                  this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
+                  this.updateMessagesReadedByTimestamp(
+                    remoteJid,
+                    remotesJidMap[remoteJid].timestamp,
+                    remotesJidMap[remoteJid].hasExternalReceipt,
+                  ),
                 ),
               );
+
+              // Emit per-participant receipt webhooks (skip self-receipts)
+              for (const event of payload) {
+                const { key, receipt } = event;
+                const participantJid = (receipt as any).userJid as string | undefined;
+
+                if (!participantJid || !key.id || !key.remoteJid) continue;
+
+                // Skip self-receipts
+                if (
+                  participantJid === selfJid ||
+                  participantJid?.replace(/:\d+/, '') === selfJid
+                ) continue;
+
+                const readTimestamp = typeof receipt.readTimestamp === 'number' ? receipt.readTimestamp : null;
+                const receiptTimestamp = typeof (receipt as any).receiptTimestamp === 'number'
+                  ? (receipt as any).receiptTimestamp
+                  : null;
+
+                if (!readTimestamp && !receiptTimestamp) continue;
+
+                const type = readTimestamp ? 'read' : 'delivered';
+                const timestamp = readTimestamp || receiptTimestamp;
+
+                this.sendDataWebhook(Events.MESSAGE_RECEIPT, {
+                  keyId: key.id,
+                  remoteJid: key.remoteJid,
+                  fromMe: key.fromMe,
+                  participantJid,
+                  type,
+                  timestamp,
+                  readTimestamp: readTimestamp || null,
+                  deliveredTimestamp: receiptTimestamp || null,
+                });
+              }
             }
 
             if (events['presence.update']) {
@@ -4793,7 +4846,11 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  private async updateMessagesReadedByTimestamp(remoteJid: string, timestamp?: number): Promise<number> {
+  private async updateMessagesReadedByTimestamp(
+    remoteJid: string,
+    timestamp?: number,
+    includeOutgoing: boolean = false,
+  ): Promise<number> {
     if (timestamp === undefined || timestamp === null) return 0;
 
     try {
@@ -4803,6 +4860,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       if (dbProvider === 'mysql') {
         // MySQL syntax with JSON_UNQUOTE and JSON_EXTRACT
+        // Update incoming messages (fromMe=false): DELIVERY_ACK → READ
         result = await this.prismaRepository.$executeRawUnsafe(
           `UPDATE Message
            SET status = ?
@@ -4817,8 +4875,29 @@ export class BaileysStartupService extends ChannelStartupService {
           timestamp,
           status[3],
         );
+
+        // Update outgoing messages (fromMe=true) only when a non-self participant read them
+        if (includeOutgoing) {
+          const outgoingResult = await this.prismaRepository.$executeRawUnsafe(
+            `UPDATE Message
+             SET status = ?
+             WHERE instanceId = ?
+             AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJid')) = ?
+             AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.fromMe')) = 'true'
+             AND messageTimestamp <= ?
+             AND (status IS NULL OR status IN (?, ?))`,
+            status[4],
+            this.instanceId,
+            remoteJid,
+            timestamp,
+            status[2],
+            status[3],
+          );
+          result += outgoingResult;
+        }
       } else {
         // PostgreSQL syntax
+        // Update incoming messages (fromMe=false): DELIVERY_ACK → READ
         result = await this.prismaRepository.$executeRaw`
           UPDATE "Message"
           SET "status" = ${status[4]}
@@ -4828,6 +4907,20 @@ export class BaileysStartupService extends ChannelStartupService {
           AND "messageTimestamp" <= ${timestamp}
           AND ("status" IS NULL OR "status" = ${status[3]})
         `;
+
+        // Update outgoing messages (fromMe=true) only when a non-self participant read them
+        if (includeOutgoing) {
+          const outgoingResult = await this.prismaRepository.$executeRaw`
+            UPDATE "Message"
+            SET "status" = ${status[4]}
+            WHERE "instanceId" = ${this.instanceId}
+            AND "key"->>'remoteJid' = ${remoteJid}
+            AND ("key"->>'fromMe')::boolean = true
+            AND "messageTimestamp" <= ${timestamp}
+            AND ("status" IS NULL OR "status" IN (${status[2]}, ${status[3]}))
+          `;
+          result += outgoingResult;
+        }
       }
 
       if (result) {
@@ -5132,37 +5225,6 @@ export class BaileysStartupService extends ChannelStartupService {
   public async fetchMessages(query: Query<Message>) {
     const keyFilters = query?.where?.key as ExtendedIMessageKey;
 
-    const timestampFilter = {};
-    if (query?.where?.messageTimestamp) {
-      if (query.where.messageTimestamp['gte'] && query.where.messageTimestamp['lte']) {
-        timestampFilter['messageTimestamp'] = {
-          gte: Math.floor(new Date(query.where.messageTimestamp['gte']).getTime() / 1000),
-          lte: Math.floor(new Date(query.where.messageTimestamp['lte']).getTime() / 1000),
-        };
-      }
-    }
-
-    const count = await this.prismaRepository.message.count({
-      where: {
-        instanceId: this.instanceId,
-        id: query?.where?.id,
-        source: query?.where?.source,
-        messageType: query?.where?.messageType,
-        ...timestampFilter,
-        AND: [
-          keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
-          {
-            OR: [
-              keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-              keyFilters?.remoteJidAlt ? { key: { path: ['remoteJidAlt'], equals: keyFilters?.remoteJidAlt } } : {},
-            ],
-          },
-        ],
-      },
-    });
-
     if (!query?.offset) {
       query.offset = 50;
     }
@@ -5171,8 +5233,122 @@ export class BaileysStartupService extends ChannelStartupService {
       query.page = 1;
     }
 
-    const messages = await this.prismaRepository.message.findMany({
-      where: {
+    const dbProvider = this.configService.get<Database>('DATABASE').PROVIDER;
+    const hasKeyFilters =
+      keyFilters?.id ||
+      keyFilters?.fromMe !== undefined ||
+      keyFilters?.remoteJid ||
+      keyFilters?.remoteJidAlt ||
+      keyFilters?.participant;
+
+    let count: number;
+    let messages: any[];
+
+    if (dbProvider === 'mysql' && hasKeyFilters) {
+      // MySQL: use raw SQL for JSON path filtering
+      const conditions: string[] = ['instanceId = ?'];
+      const params: any[] = [this.instanceId];
+
+      if (query?.where?.id) {
+        conditions.push('id = ?');
+        params.push(query.where.id);
+      }
+      if (query?.where?.source) {
+        conditions.push('source = ?');
+        params.push(query.where.source);
+      }
+      if (query?.where?.messageType) {
+        conditions.push('messageType = ?');
+        params.push(query.where.messageType);
+      }
+      if (query?.where?.messageTimestamp?.['gte'] && query?.where?.messageTimestamp?.['lte']) {
+        conditions.push('messageTimestamp >= ? AND messageTimestamp <= ?');
+        params.push(
+          Math.floor(new Date(query.where.messageTimestamp['gte']).getTime() / 1000),
+          Math.floor(new Date(query.where.messageTimestamp['lte']).getTime() / 1000),
+        );
+      }
+
+      // JSON key filters
+      if (keyFilters?.id) {
+        conditions.push("JSON_UNQUOTE(JSON_EXTRACT(`key`, '$.id')) = ?");
+        params.push(keyFilters.id);
+      }
+      if (keyFilters?.fromMe) {
+        conditions.push("JSON_UNQUOTE(JSON_EXTRACT(`key`, '$.fromMe')) = 'true'");
+      }
+      if (keyFilters?.participant) {
+        conditions.push("JSON_UNQUOTE(JSON_EXTRACT(`key`, '$.participant')) = ?");
+        params.push(keyFilters.participant);
+      }
+
+      // remoteJid OR remoteJidAlt
+      if (keyFilters?.remoteJid && keyFilters?.remoteJidAlt) {
+        conditions.push(
+          "(JSON_UNQUOTE(JSON_EXTRACT(`key`, '$.remoteJid')) = ? OR JSON_UNQUOTE(JSON_EXTRACT(`key`, '$.remoteJidAlt')) = ?)",
+        );
+        params.push(keyFilters.remoteJid, keyFilters.remoteJidAlt);
+      } else if (keyFilters?.remoteJid) {
+        conditions.push("JSON_UNQUOTE(JSON_EXTRACT(`key`, '$.remoteJid')) = ?");
+        params.push(keyFilters.remoteJid);
+      } else if (keyFilters?.remoteJidAlt) {
+        conditions.push("JSON_UNQUOTE(JSON_EXTRACT(`key`, '$.remoteJidAlt')) = ?");
+        params.push(keyFilters.remoteJidAlt);
+      }
+
+      const whereClause = conditions.join(' AND ');
+
+      // Count query
+      const countResult = await this.prismaRepository.$queryRawUnsafe<{ count: number }[]>(
+        `SELECT COUNT(*) as count FROM Message WHERE ${whereClause}`,
+        ...params,
+      );
+      count = Number(countResult[0]?.count) || 0;
+
+      // Get matching message IDs with pagination
+      const skip = query.offset * (query.page === 1 ? 0 : query.page - 1);
+      const messageIdRows = await this.prismaRepository.$queryRawUnsafe<{ id: string }[]>(
+        `SELECT id FROM Message WHERE ${whereClause} ORDER BY messageTimestamp DESC LIMIT ? OFFSET ?`,
+        ...params,
+        query.offset,
+        skip,
+      );
+      const messageIds = messageIdRows.map((row) => row.id);
+
+      if (messageIds.length > 0) {
+        messages = await this.prismaRepository.message.findMany({
+          where: { id: { in: messageIds } },
+          orderBy: { messageTimestamp: 'desc' },
+          select: {
+            id: true,
+            key: true,
+            pushName: true,
+            messageType: true,
+            message: true,
+            messageTimestamp: true,
+            instanceId: true,
+            source: true,
+            status: true,
+            contextInfo: true,
+            MessageUpdate: { select: { status: true } },
+          },
+        });
+      } else {
+        messages = [];
+      }
+    } else {
+      // PostgreSQL (or no key filters): use Prisma JSON path filtering
+      const timestampFilter = {};
+      if (query?.where?.messageTimestamp) {
+        if (query.where.messageTimestamp['gte'] && query.where.messageTimestamp['lte']) {
+          timestampFilter['messageTimestamp'] = {
+            gte: Math.floor(new Date(query.where.messageTimestamp['gte']).getTime() / 1000),
+            lte: Math.floor(new Date(query.where.messageTimestamp['lte']).getTime() / 1000),
+          };
+        }
+      }
+
+      const prismaWhere = {
         instanceId: this.instanceId,
         id: query?.where?.id,
         source: query?.where?.source,
@@ -5189,23 +5365,30 @@ export class BaileysStartupService extends ChannelStartupService {
             ],
           },
         ],
-      },
-      orderBy: { messageTimestamp: 'desc' },
-      skip: query.offset * (query?.page === 1 ? 0 : (query?.page as number) - 1),
-      take: query.offset,
-      select: {
-        id: true,
-        key: true,
-        pushName: true,
-        messageType: true,
-        message: true,
-        messageTimestamp: true,
-        instanceId: true,
-        source: true,
-        contextInfo: true,
-        MessageUpdate: { select: { status: true } },
-      },
-    });
+      };
+
+      count = await this.prismaRepository.message.count({ where: prismaWhere });
+
+      messages = await this.prismaRepository.message.findMany({
+        where: prismaWhere,
+        orderBy: { messageTimestamp: 'desc' },
+        skip: query.offset * (query?.page === 1 ? 0 : (query?.page as number) - 1),
+        take: query.offset,
+        select: {
+          id: true,
+          key: true,
+          pushName: true,
+          messageType: true,
+          message: true,
+          messageTimestamp: true,
+          instanceId: true,
+          source: true,
+          status: true,
+          contextInfo: true,
+          MessageUpdate: { select: { status: true } },
+        },
+      });
+    }
 
     const formattedMessages = messages.map((message) => {
       const messageKey = message.key as { fromMe: boolean; remoteJid: string; id: string; participant?: string };
