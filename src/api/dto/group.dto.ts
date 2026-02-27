@@ -26,6 +26,7 @@ export class GroupJid {
 
 export class GetParticipant {
   getParticipants: string;
+  getProfilePictures?: string;
 }
 
 export class GroupInvite {
