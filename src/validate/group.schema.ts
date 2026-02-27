@@ -59,6 +59,7 @@ export const getParticipantsSchema: JSONSchema7 = {
   type: 'object',
   properties: {
     getParticipants: { type: 'string', enum: ['true', 'false'] },
+    getProfilePictures: { type: 'string', enum: ['true', 'false'] },
   },
   required: ['getParticipants'],
   ...isNotEmpty('getParticipants'),

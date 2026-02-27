@@ -4483,38 +4483,63 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async fetchAllGroups(getParticipants: GetParticipant) {
-    const fetch = Object.values(await this?.client?.groupFetchAllParticipating());
+    try {
+      const fetch = Object.values(await this?.client?.groupFetchAllParticipating());
 
-    let groups = [];
-    for (const group of fetch) {
-      const picture = await this.profilePicture(group.id);
+      const skipPictures = getParticipants.getProfilePictures === 'false';
+      const includeParticipants = getParticipants.getParticipants === 'true';
 
-      const result = {
-        id: group.id,
-        subject: group.subject,
-        subjectOwner: group.subjectOwner,
-        subjectTime: group.subjectTime,
-        pictureUrl: picture?.profilePictureUrl,
-        size: group.participants.length,
-        creation: group.creation,
-        owner: group.owner,
-        desc: group.desc,
-        descId: group.descId,
-        restrict: group.restrict,
-        announce: group.announce,
-        isCommunity: group.isCommunity,
-        isCommunityAnnounce: group.isCommunityAnnounce,
-        linkedParent: group.linkedParent,
-      };
+      // Fetch profile pictures in parallel with concurrency limit
+      const CONCURRENCY = 5;
+      const pictures: Map<string, string | null> = new Map();
 
-      if (getParticipants.getParticipants == 'true') {
-        result['participants'] = group.participants;
+      if (!skipPictures) {
+        for (let i = 0; i < fetch.length; i += CONCURRENCY) {
+          const batch = fetch.slice(i, i + CONCURRENCY);
+          const results = await Promise.allSettled(batch.map((group) => this.profilePicture(group.id)));
+
+          results.forEach((result, index) => {
+            if (result.status === 'fulfilled') {
+              pictures.set(batch[index].id, result.value?.profilePictureUrl ?? null);
+            } else {
+              pictures.set(batch[index].id, null);
+            }
+          });
+        }
       }
 
-      groups = [...groups, result];
-    }
+      const groups = [];
+      for (const group of fetch) {
+        const result: Record<string, unknown> = {
+          id: group.id,
+          subject: group.subject,
+          subjectOwner: group.subjectOwner,
+          subjectTime: group.subjectTime,
+          pictureUrl: skipPictures ? null : (pictures.get(group.id) ?? null),
+          size: group.participants.length,
+          creation: group.creation,
+          owner: group.owner,
+          desc: group.desc,
+          descId: group.descId,
+          restrict: group.restrict,
+          announce: group.announce,
+          isCommunity: group.isCommunity,
+          isCommunityAnnounce: group.isCommunityAnnounce,
+          linkedParent: group.linkedParent,
+        };
 
-    return groups;
+        if (includeParticipants) {
+          result.participants = group.participants;
+        }
+
+        groups.push(result);
+      }
+
+      return groups;
+    } catch (error) {
+      this.logger.error(error);
+      throw new InternalServerErrorException('Error fetching groups', error?.toString());
+    }
   }
 
   public async inviteCode(id: GroupJid) {
