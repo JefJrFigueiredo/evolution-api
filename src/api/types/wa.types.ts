@@ -34,6 +34,7 @@ export enum Events {
   LABELS_ASSOCIATION = 'labels.association',
   CREDS_UPDATE = 'creds.update',
   MESSAGING_HISTORY_SET = 'messaging-history.set',
+  MESSAGE_RECEIPT = 'message.receipt',
   REMOVE_INSTANCE = 'remove.instance',
   LOGOUT_INSTANCE = 'logout.instance',
 }
