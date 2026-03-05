@@ -1502,6 +1502,20 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
+          // Sync participant column after LID resolution
+          if (messageRaw.key.participant && messageRaw.participant !== messageRaw.key.participant) {
+            messageRaw.participant = messageRaw.key.participant;
+          }
+
+          // If pushName is still a bare LID number after resolution, replace with phone number
+          if (
+            messageRaw.pushName &&
+            /^\d{10,}$/.test(messageRaw.pushName) &&
+            messageRaw.participant?.includes('@s.whatsapp.net')
+          ) {
+            messageRaw.pushName = messageRaw.participant.split('@')[0];
+          }
+
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
           await chatbotController.emit({
@@ -4768,13 +4782,38 @@ export class BaileysStartupService extends ChannelStartupService {
     const contentType = getContentType(message.message);
     const contentMsg = message?.message[contentType] as any;
 
+    // Resolve participant for group messages:
+    // Priority: participantAlt (@s.whatsapp.net) > key.participant > top-level message.participant
+    const extKey = message.key as any;
+    const isGroup = message.key?.remoteJid?.includes('@g.us') || extKey?.remoteJidAlt?.includes('@g.us');
+    const resolvedParticipant = isGroup
+      ? (extKey?.participantAlt || message.key?.participant || (message as any).participant || null)
+      : null;
+
+    // Copy key and inject participant if missing
+    const key = { ...message.key };
+    if (isGroup && !key.participant && resolvedParticipant) {
+      key.participant = resolvedParticipant;
+    }
+
+    // Resolve pushName: if it's a bare LID number and we have a phone JID, use the phone number
+    let pushName =
+      message.pushName ||
+      (message.key.fromMe
+        ? 'Você'
+        : resolvedParticipant ? resolvedParticipant.split('@')[0] : null);
+    if (
+      pushName &&
+      /^\d{10,}$/.test(pushName) &&
+      resolvedParticipant?.includes('@s.whatsapp.net')
+    ) {
+      pushName = resolvedParticipant.split('@')[0];
+    }
+
     const messageRaw = {
-      key: message.key, // Save key exactly as it comes from Baileys
-      pushName:
-        message.pushName ||
-        (message.key.fromMe
-          ? 'Você'
-          : message?.participant || (message.key?.participant ? message.key.participant.split('@')[0] : null)),
+      key,
+      pushName,
+      participant: resolvedParticipant,
       status: status[message.status],
       message: this.deserializeMessageBuffers({ ...message.message }),
       contextInfo: this.deserializeMessageBuffers(contentMsg?.contextInfo),
@@ -5323,6 +5362,7 @@ export class BaileysStartupService extends ChannelStartupService {
             id: true,
             key: true,
             pushName: true,
+            participant: true,
             messageType: true,
             message: true,
             messageTimestamp: true,
@@ -5378,6 +5418,7 @@ export class BaileysStartupService extends ChannelStartupService {
           id: true,
           key: true,
           pushName: true,
+          participant: true,
           messageType: true,
           message: true,
           messageTimestamp: true,
