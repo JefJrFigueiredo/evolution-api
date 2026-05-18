@@ -456,7 +456,13 @@ export class InstanceController {
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) waInstances?.clearCacheChatwoot();
 
       if (instance.state === 'connecting' || instance.state === 'open') {
-        await this.logout({ instanceName });
+        try {
+          await this.logout({ instanceName });
+        } catch (error) {
+          this.logger.warn(
+            `deleteInstance: logout failed for ${instanceName}, forcing removal - ${error?.toString() ?? error}`,
+          );
+        }
       }
 
       try {

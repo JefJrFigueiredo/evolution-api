@@ -266,7 +266,16 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async logoutInstance() {
     this.messageProcessor.onDestroy();
-    await this.client?.logout('Log out instance: ' + this.instanceName);
+
+    try {
+      await this.client?.logout('Log out instance: ' + this.instanceName);
+    } catch (error) {
+      // Socket already dead: the companion device cannot be unlinked remotely, but
+      // local teardown must still proceed. Treat as idempotent success.
+      this.logger.warn(
+        `logoutInstance: socket already closed for ${this.instanceName} - ${error?.toString() ?? error}`,
+      );
+    }
 
     this.client?.ws?.close();
 
@@ -2017,15 +2026,11 @@ export class BaileysStartupService extends ChannelStartupService {
                 if (!participantJid || !key.id || !key.remoteJid) continue;
 
                 // Skip self-receipts
-                if (
-                  participantJid === selfJid ||
-                  participantJid?.replace(/:\d+/, '') === selfJid
-                ) continue;
+                if (participantJid === selfJid || participantJid?.replace(/:\d+/, '') === selfJid) continue;
 
                 const readTimestamp = typeof receipt.readTimestamp === 'number' ? receipt.readTimestamp : null;
-                const receiptTimestamp = typeof (receipt as any).receiptTimestamp === 'number'
-                  ? (receipt as any).receiptTimestamp
-                  : null;
+                const receiptTimestamp =
+                  typeof (receipt as any).receiptTimestamp === 'number' ? (receipt as any).receiptTimestamp : null;
 
                 if (!readTimestamp && !receiptTimestamp) continue;
 
@@ -4787,7 +4792,7 @@ export class BaileysStartupService extends ChannelStartupService {
     const extKey = message.key as any;
     const isGroup = message.key?.remoteJid?.includes('@g.us') || extKey?.remoteJidAlt?.includes('@g.us');
     const resolvedParticipant = isGroup
-      ? (extKey?.participantAlt || message.key?.participant || (message as any).participant || null)
+      ? extKey?.participantAlt || message.key?.participant || (message as any).participant || null
       : null;
 
     // Copy key and inject participant if missing
@@ -4799,14 +4804,8 @@ export class BaileysStartupService extends ChannelStartupService {
     // Resolve pushName: if it's a bare LID number and we have a phone JID, use the phone number
     let pushName =
       message.pushName ||
-      (message.key.fromMe
-        ? 'Você'
-        : resolvedParticipant ? resolvedParticipant.split('@')[0] : null);
-    if (
-      pushName &&
-      /^\d{10,}$/.test(pushName) &&
-      resolvedParticipant?.includes('@s.whatsapp.net')
-    ) {
+      (message.key.fromMe ? 'Você' : resolvedParticipant ? resolvedParticipant.split('@')[0] : null);
+    if (pushName && /^\d{10,}$/.test(pushName) && resolvedParticipant?.includes('@s.whatsapp.net')) {
       pushName = resolvedParticipant.split('@')[0];
     }
 
